@@ -1,287 +1,465 @@
-import { query, transaction } from '../config/database.js';
-import { NotFoundError, ValidationError, AuthorizationError } from '../utils/errors.js';
-import logger from '../config/logger.js';
+const BaseModel = require('./BaseModel');
+const config = require('../config/environment');
+const logger = require('../config/logger');
 
 /**
- * Team 모델
- * Clean Architecture: Domain Layer
+ * 팀 모델
+ * 팀 정보 관리 및 팀원 관리 기능 제공
  */
-class Team {
-  /**
-   * ID로 팀 조회
-   * @param {number} id - 팀 ID
-   * @returns {Promise<Object>} - 팀 정보
-   */
-  static async findById(id) {
-    const result = await query(
-      `SELECT id, name, description, invite_code, creator_id, created_at, updated_at
-       FROM teams
-       WHERE id = $1`,
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      throw new NotFoundError('팀을 찾을 수 없습니다');
-    }
-
-    return result.rows[0];
+class Team extends BaseModel {
+  constructor() {
+    super('teams');
   }
 
   /**
    * 초대 코드로 팀 조회
    * @param {string} inviteCode - 초대 코드
-   * @returns {Promise<Object|null>} - 팀 정보
    */
-  static async findByInviteCode(inviteCode) {
-    const result = await query(
-      `SELECT id, name, description, invite_code, creator_id, created_at, updated_at
-       FROM teams
-       WHERE invite_code = $1`,
-      [inviteCode]
-    );
+  async findByInviteCode(inviteCode) {
+    const start = Date.now();
+    try {
+      const result = await this.findOne({ invite_code: inviteCode });
 
-    return result.rows[0] || null;
+      logger.performance('Team.findByInviteCode', Date.now() - start, {
+        inviteCode,
+        found: !!result,
+      });
+
+      return result;
+    } catch (error) {
+      logger.error('Team.findByInviteCode 오류:', { inviteCode, error: error.message });
+      throw error;
+    }
   }
 
   /**
-   * 팀 생성 (트랜잭션)
-   * @param {Object} teamData - 팀 정보
+   * 새 팀 생성
+   * @param {Object} teamData - 팀 데이터
    * @param {string} teamData.name - 팀 이름
    * @param {string} teamData.description - 팀 설명
    * @param {number} teamData.creatorId - 생성자 ID
-   * @returns {Promise<Object>} - 생성된 팀 정보
    */
-  static async create({ name, description, creatorId }) {
-    return await transaction(async (client) => {
+  async createTeam(teamData) {
+    const start = Date.now();
+    try {
+      const { name, description, creatorId } = teamData;
+
+      // 입력 검증
+      this.validateTeamData({ name, description });
+
+      // 생성자가 이미 만든 팀 개수 확인
+      const userTeamCount = await this.getUserTeamCount(creatorId);
+      if (userTeamCount >= config.business.maxTeamsPerUser) {
+        throw new Error(`사용자당 최대 ${config.business.maxTeamsPerUser}개의 팀만 생성할 수 있습니다`);
+      }
+
       // 초대 코드 생성
-      const inviteCodeResult = await client.query('SELECT generate_invite_code() as code');
-      const inviteCode = inviteCodeResult.rows[0].code;
+      const inviteCode = await this.generateUniqueInviteCode();
 
-      // 팀 생성
-      const teamResult = await client.query(
-        `INSERT INTO teams (name, description, invite_code, creator_id)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, name, description, invite_code, creator_id, created_at, updated_at`,
-        [name, description || null, inviteCode, creatorId]
-      );
+      // 트랜잭션으로 팀과 팀원 생성
+      const result = await this.transaction(async (client) => {
+        // 팀 생성
+        const teamResult = await client.query(`
+          INSERT INTO teams (name, description, invite_code, creator_id)
+          VALUES ($1, $2, $3, $4)
+          RETURNING *
+        `, [name.trim(), description?.trim() || null, inviteCode, creatorId]);
 
-      const team = teamResult.rows[0];
+        const team = teamResult.rows[0];
 
-      // 생성자를 팀장으로 추가
-      await client.query(
-        `INSERT INTO team_members (team_id, user_id, role)
-         VALUES ($1, $2, $3)`,
-        [team.id, creatorId, 'leader']
-      );
+        // 생성자를 팀장으로 추가
+        await client.query(`
+          INSERT INTO team_members (team_id, user_id, role)
+          VALUES ($1, $2, 'leader')
+        `, [team.id, creatorId]);
 
-      logger.info('팀 생성 완료', { teamId: team.id, creatorId, inviteCode });
-      return team;
-    });
+        return team;
+      });
+
+      logger.performance('Team.createTeam', Date.now() - start, {
+        teamId: result.id,
+        creatorId,
+      });
+
+      logger.audit('TEAM_CREATED', {
+        teamId: result.id,
+        teamName: name.trim(),
+        creatorId,
+        inviteCode,
+      });
+
+      return result;
+    } catch (error) {
+      logger.error('Team.createTeam 오류:', {
+        teamData,
+        error: error.message
+      });
+      throw error;
+    }
   }
 
   /**
-   * 팀 정보 수정
-   * @param {number} id - 팀 ID
-   * @param {Object} updates - 수정할 정보
-   * @returns {Promise<Object>} - 수정된 팀 정보
+   * 팀에 멤버 추가
+   * @param {number} teamId - 팀 ID
+   * @param {number} userId - 사용자 ID
+   * @param {string} role - 역할 (leader, member)
    */
-  static async update(id, updates) {
-    const { name, description } = updates;
+  async addMember(teamId, userId, role = 'member') {
+    const start = Date.now();
+    try {
+      // 팀 존재 확인
+      const team = await this.findById(teamId);
+      if (!team) {
+        throw new Error('팀을 찾을 수 없습니다');
+      }
 
-    const result = await query(
-      `UPDATE teams
-       SET name = COALESCE($1, name),
-           description = COALESCE($2, description)
-       WHERE id = $3
-       RETURNING id, name, description, invite_code, creator_id, created_at, updated_at`,
-      [name, description, id]
-    );
+      // 이미 팀원인지 확인
+      const existingMember = await this.getMember(teamId, userId);
+      if (existingMember) {
+        throw new Error('이미 팀의 멤버입니다');
+      }
 
-    if (result.rows.length === 0) {
-      throw new NotFoundError('팀을 찾을 수 없습니다');
+      // 팀 최대 인원 확인
+      const memberCount = await this.getMemberCount(teamId);
+      if (memberCount >= config.business.maxTeamMembers) {
+        throw new Error(`팀당 최대 ${config.business.maxTeamMembers}명까지만 가능합니다`);
+      }
+
+      // 역할 검증
+      if (!['leader', 'member'].includes(role)) {
+        throw new Error('올바르지 않은 역할입니다');
+      }
+
+      // 팀원 추가
+      const result = await this.db.query(`
+        INSERT INTO team_members (team_id, user_id, role)
+        VALUES ($1, $2, $3)
+        RETURNING *
+      `, [teamId, userId, role]);
+
+      logger.performance('Team.addMember', Date.now() - start, {
+        teamId,
+        userId,
+        role,
+      });
+
+      logger.audit('TEAM_MEMBER_ADDED', {
+        teamId,
+        userId,
+        role,
+        addedBy: 'system', // 실제로는 요청한 사용자 ID가 들어가야 함
+      });
+
+      return result.rows[0];
+    } catch (error) {
+      logger.error('Team.addMember 오류:', {
+        teamId,
+        userId,
+        role,
+        error: error.message
+      });
+      throw error;
     }
-
-    logger.info('팀 정보 수정 완료', { teamId: id });
-    return result.rows[0];
   }
 
   /**
-   * 팀 삭제
-   * @param {number} id - 팀 ID
-   * @returns {Promise<void>}
+   * 팀에서 멤버 제거
+   * @param {number} teamId - 팀 ID
+   * @param {number} userId - 사용자 ID
    */
-  static async delete(id) {
-    const result = await query(
-      'DELETE FROM teams WHERE id = $1 RETURNING id',
-      [id]
-    );
+  async removeMember(teamId, userId) {
+    const start = Date.now();
+    try {
+      // 팀 생성자는 제거할 수 없음
+      const team = await this.findById(teamId);
+      if (team.creator_id === userId) {
+        throw new Error('팀 생성자는 팀에서 나갈 수 없습니다');
+      }
 
-    if (result.rows.length === 0) {
-      throw new NotFoundError('팀을 찾을 수 없습니다');
+      // 팀원 제거
+      const result = await this.db.query(`
+        DELETE FROM team_members
+        WHERE team_id = $1 AND user_id = $2
+        RETURNING *
+      `, [teamId, userId]);
+
+      if (result.rows.length === 0) {
+        throw new Error('팀 멤버가 아닙니다');
+      }
+
+      logger.performance('Team.removeMember', Date.now() - start, {
+        teamId,
+        userId,
+      });
+
+      logger.audit('TEAM_MEMBER_REMOVED', {
+        teamId,
+        userId,
+        removedBy: 'system', // 실제로는 요청한 사용자 ID가 들어가야 함
+      });
+
+      return true;
+    } catch (error) {
+      logger.error('Team.removeMember 오류:', {
+        teamId,
+        userId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * 팀 멤버 조회
+   * @param {number} teamId - 팀 ID
+   * @param {number} userId - 사용자 ID
+   */
+  async getMember(teamId, userId) {
+    const start = Date.now();
+    try {
+      const result = await this.db.query(`
+        SELECT tm.*, u.name, u.email
+        FROM team_members tm
+        JOIN users u ON tm.user_id = u.id
+        WHERE tm.team_id = $1 AND tm.user_id = $2
+      `, [teamId, userId]);
+
+      logger.performance('Team.getMember', Date.now() - start, {
+        teamId,
+        userId,
+        found: result.rows.length > 0,
+      });
+
+      return result.rows[0] || null;
+    } catch (error) {
+      logger.error('Team.getMember 오류:', {
+        teamId,
+        userId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * 팀의 모든 멤버 조회
+   * @param {number} teamId - 팀 ID
+   */
+  async getMembers(teamId) {
+    const start = Date.now();
+    try {
+      const result = await this.db.query(`
+        SELECT
+          tm.id,
+          tm.user_id,
+          tm.role,
+          tm.joined_at,
+          u.name,
+          u.email
+        FROM team_members tm
+        JOIN users u ON tm.user_id = u.id
+        WHERE tm.team_id = $1
+        ORDER BY tm.role DESC, tm.joined_at ASC
+      `, [teamId]);
+
+      logger.performance('Team.getMembers', Date.now() - start, {
+        teamId,
+        memberCount: result.rows.length,
+      });
+
+      return result.rows;
+    } catch (error) {
+      logger.error('Team.getMembers 오류:', {
+        teamId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * 팀 멤버 수 조회
+   * @param {number} teamId - 팀 ID
+   */
+  async getMemberCount(teamId) {
+    const start = Date.now();
+    try {
+      const result = await this.db.query(`
+        SELECT COUNT(*) as count
+        FROM team_members
+        WHERE team_id = $1
+      `, [teamId]);
+
+      const count = parseInt(result.rows[0].count);
+
+      logger.performance('Team.getMemberCount', Date.now() - start, {
+        teamId,
+        count,
+      });
+
+      return count;
+    } catch (error) {
+      logger.error('Team.getMemberCount 오류:', {
+        teamId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * 사용자가 생성한 팀 개수 조회
+   * @param {number} userId - 사용자 ID
+   */
+  async getUserTeamCount(userId) {
+    const start = Date.now();
+    try {
+      const result = await this.db.query(`
+        SELECT COUNT(*) as count
+        FROM teams
+        WHERE creator_id = $1
+      `, [userId]);
+
+      const count = parseInt(result.rows[0].count);
+
+      logger.performance('Team.getUserTeamCount', Date.now() - start, {
+        userId,
+        count,
+      });
+
+      return count;
+    } catch (error) {
+      logger.error('Team.getUserTeamCount 오류:', {
+        userId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * 사용자가 팀의 리더인지 확인
+   * @param {number} teamId - 팀 ID
+   * @param {number} userId - 사용자 ID
+   */
+  async isTeamLeader(teamId, userId) {
+    const member = await this.getMember(teamId, userId);
+    return member && member.role === 'leader';
+  }
+
+  /**
+   * 사용자가 팀의 멤버인지 확인
+   * @param {number} teamId - 팀 ID
+   * @param {number} userId - 사용자 ID
+   */
+  async isTeamMember(teamId, userId) {
+    const member = await this.getMember(teamId, userId);
+    return !!member;
+  }
+
+  /**
+   * 고유한 초대 코드 생성
+   */
+  async generateUniqueInviteCode() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let attempts = 0;
+    const maxAttempts = 10;
+
+    while (attempts < maxAttempts) {
+      let code = '';
+      for (let i = 0; i < config.business.inviteCodeLength; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+
+      // 중복 확인
+      const existing = await this.findByInviteCode(code);
+      if (!existing) {
+        return code;
+      }
+
+      attempts++;
     }
 
-    logger.info('팀 삭제 완료', { teamId: id });
+    throw new Error('초대 코드 생성에 실패했습니다');
   }
 
   /**
    * 초대 코드 재생성
    * @param {number} teamId - 팀 ID
-   * @returns {Promise<string>} - 새 초대 코드
    */
-  static async regenerateInviteCode(teamId) {
-    const inviteCodeResult = await query('SELECT generate_invite_code() as code');
-    const newCode = inviteCodeResult.rows[0].code;
+  async regenerateInviteCode(teamId) {
+    const start = Date.now();
+    try {
+      const newInviteCode = await this.generateUniqueInviteCode();
 
-    const result = await query(
-      `UPDATE teams
-       SET invite_code = $1
-       WHERE id = $2
-       RETURNING invite_code`,
-      [newCode, teamId]
-    );
+      const result = await this.update(teamId, {
+        invite_code: newInviteCode,
+      });
 
-    if (result.rows.length === 0) {
-      throw new NotFoundError('팀을 찾을 수 없습니다');
+      logger.performance('Team.regenerateInviteCode', Date.now() - start, {
+        teamId,
+      });
+
+      logger.audit('TEAM_INVITE_CODE_REGENERATED', {
+        teamId,
+        newInviteCode,
+      });
+
+      return result;
+    } catch (error) {
+      logger.error('Team.regenerateInviteCode 오류:', {
+        teamId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * 팀 데이터 검증
+   * @param {Object} teamData - 검증할 팀 데이터
+   */
+  validateTeamData(teamData) {
+    const { name, description } = teamData;
+
+    this.validateTeamName(name);
+
+    if (description !== undefined && description !== null) {
+      this.validateTeamDescription(description);
+    }
+  }
+
+  /**
+   * 팀 이름 검증
+   * @param {string} name - 팀 이름
+   */
+  validateTeamName(name) {
+    if (!name) {
+      throw new Error('팀 이름은 필수입니다');
     }
 
-    logger.info('초대 코드 재생성 완료', { teamId, newCode });
-    return result.rows[0].invite_code;
-  }
-
-  /**
-   * 팀 멤버 추가
-   * @param {number} teamId - 팀 ID
-   * @param {number} userId - 사용자 ID
-   * @param {string} role - 역할 (leader, member)
-   * @returns {Promise<Object>} - 멤버 정보
-   */
-  static async addMember(teamId, userId, role = 'member') {
-    // 이미 멤버인지 확인
-    const existing = await query(
-      'SELECT id FROM team_members WHERE team_id = $1 AND user_id = $2',
-      [teamId, userId]
-    );
-
-    if (existing.rows.length > 0) {
-      throw new ValidationError('이미 팀 멤버입니다');
+    const trimmedName = name.trim();
+    if (trimmedName.length < config.business.minTeamNameLength ||
+        trimmedName.length > config.business.maxTeamNameLength) {
+      throw new Error(`팀 이름은 ${config.business.minTeamNameLength}-${config.business.maxTeamNameLength}자여야 합니다`);
     }
 
-    const result = await query(
-      `INSERT INTO team_members (team_id, user_id, role)
-       VALUES ($1, $2, $3)
-       RETURNING id, team_id, user_id, role, joined_at`,
-      [teamId, userId, role]
-    );
-
-    logger.info('팀 멤버 추가 완료', { teamId, userId, role });
-    return result.rows[0];
-  }
-
-  /**
-   * 팀 멤버 제거
-   * @param {number} teamId - 팀 ID
-   * @param {number} userId - 사용자 ID
-   * @returns {Promise<void>}
-   */
-  static async removeMember(teamId, userId) {
-    const result = await query(
-      'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2 RETURNING id',
-      [teamId, userId]
-    );
-
-    if (result.rows.length === 0) {
-      throw new NotFoundError('팀 멤버를 찾을 수 없습니다');
+    // 특수문자 제한 (한글, 영문, 숫자, 공백, 일부 특수문자만 허용)
+    const nameRegex = /^[가-힣a-zA-Z0-9\s\-_()]+$/;
+    if (!nameRegex.test(trimmedName)) {
+      throw new Error('팀 이름에는 한글, 영문, 숫자, 공백, 하이픈, 언더스코어, 괄호만 사용할 수 있습니다');
     }
-
-    logger.info('팀 멤버 제거 완료', { teamId, userId });
   }
 
   /**
-   * 팀 멤버 목록 조회
-   * @param {number} teamId - 팀 ID
-   * @returns {Promise<Array>} - 멤버 목록
+   * 팀 설명 검증
+   * @param {string} description - 팀 설명
    */
-  static async getMembers(teamId) {
-    const result = await query(
-      `SELECT tm.id, tm.team_id, tm.user_id, tm.role, tm.joined_at,
-              u.name as user_name, u.email as user_email
-       FROM team_members tm
-       JOIN users u ON tm.user_id = u.id
-       WHERE tm.team_id = $1
-       ORDER BY tm.role DESC, tm.joined_at ASC`,
-      [teamId]
-    );
-
-    return result.rows;
-  }
-
-  /**
-   * 사용자의 팀 멤버십 조회
-   * @param {number} teamId - 팀 ID
-   * @param {number} userId - 사용자 ID
-   * @returns {Promise<Object|null>} - 멤버십 정보
-   */
-  static async getMembership(teamId, userId) {
-    const result = await query(
-      `SELECT id, team_id, user_id, role, joined_at
-       FROM team_members
-       WHERE team_id = $1 AND user_id = $2`,
-      [teamId, userId]
-    );
-
-    return result.rows[0] || null;
-  }
-
-  /**
-   * 사용자가 속한 팀 목록 조회
-   * @param {number} userId - 사용자 ID
-   * @returns {Promise<Array>} - 팀 목록
-   */
-  static async getUserTeams(userId) {
-    const result = await query(
-      `SELECT t.id, t.name, t.description, t.invite_code, t.creator_id,
-              t.created_at, t.updated_at, tm.role, tm.joined_at
-       FROM teams t
-       JOIN team_members tm ON t.id = tm.team_id
-       WHERE tm.user_id = $1
-       ORDER BY tm.joined_at DESC`,
-      [userId]
-    );
-
-    return result.rows;
-  }
-
-  /**
-   * 사용자가 팀장인지 확인
-   * @param {number} teamId - 팀 ID
-   * @param {number} userId - 사용자 ID
-   * @returns {Promise<boolean>} - 팀장 여부
-   */
-  static async isLeader(teamId, userId) {
-    const result = await query(
-      `SELECT role FROM team_members
-       WHERE team_id = $1 AND user_id = $2`,
-      [teamId, userId]
-    );
-
-    return result.rows.length > 0 && result.rows[0].role === 'leader';
-  }
-
-  /**
-   * 사용자가 팀 멤버인지 확인
-   * @param {number} teamId - 팀 ID
-   * @param {number} userId - 사용자 ID
-   * @returns {Promise<boolean>} - 멤버 여부
-   */
-  static async isMember(teamId, userId) {
-    const result = await query(
-      `SELECT id FROM team_members
-       WHERE team_id = $1 AND user_id = $2`,
-      [teamId, userId]
-    );
-
-    return result.rows.length > 0;
+  validateTeamDescription(description) {
+    if (description && description.length > 500) {
+      throw new Error('팀 설명은 500자를 초과할 수 없습니다');
+    }
   }
 }
 
-export default Team;
+module.exports = new Team();

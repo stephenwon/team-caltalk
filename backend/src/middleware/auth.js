@@ -1,134 +1,268 @@
-import { verifyToken } from '../config/jwt.js';
-import { unauthorized, forbidden } from '../utils/response.js';
-import { AuthenticationError, AuthorizationError } from '../utils/errors.js';
-import Team from '../models/Team.js';
-import logger from '../config/logger.js';
+const AuthService = require('../services/AuthService');
+const logger = require('../config/logger');
 
 /**
  * JWT 인증 미들웨어
- * Clean Architecture: Interface Adapters Layer
+ * Authorization 헤더에서 토큰을 추출하고 검증
  */
-export const authenticate = async (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   try {
-    // Authorization 헤더 확인
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return unauthorized(res, '인증 토큰이 필요합니다');
+
+    if (!authHeader) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authorization 헤더가 없습니다',
+        code: 'MISSING_AUTH_HEADER',
+      });
     }
 
-    // 토큰 추출 및 검증
-    const token = authHeader.substring(7);
-    const decoded = verifyToken(token);
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        error: 'Bearer 토큰 형식이 아닙니다',
+        code: 'INVALID_AUTH_FORMAT',
+      });
+    }
 
-    // 사용자 정보를 request에 추가
-    req.user = {
-      userId: decoded.userId,
-      email: decoded.email
-    };
+    const token = authHeader.substring(7); // 'Bearer ' 제거
 
-    logger.debug('인증 성공', { userId: decoded.userId });
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: '토큰이 제공되지 않았습니다',
+        code: 'MISSING_TOKEN',
+      });
+    }
+
+    // 토큰 검증 및 사용자 정보 조회
+    const user = await AuthService.getUserFromToken(token);
+
+    // req 객체에 사용자 정보 추가
+    req.user = user;
+    req.token = token;
+
+    // 토큰 만료 임박 시 헤더에 알림
+    if (AuthService.isTokenExpiringSoon(token)) {
+      res.set('X-Token-Expiring', 'true');
+    }
+
     next();
   } catch (error) {
-    logger.warn('인증 실패', { error: error.message });
-    return unauthorized(res, error.message);
+    logger.error('인증 미들웨어 오류:', {
+      error: error.message,
+      ip: req.ip,
+      userAgent: req.get('User-Agent'),
+    });
+
+    let statusCode = 401;
+    let errorCode = 'AUTH_FAILED';
+
+    if (error.message.includes('만료')) {
+      errorCode = 'TOKEN_EXPIRED';
+    } else if (error.message.includes('유효하지 않은')) {
+      errorCode = 'INVALID_TOKEN';
+    } else if (error.message.includes('찾을 수 없습니다')) {
+      errorCode = 'USER_NOT_FOUND';
+    }
+
+    return res.status(statusCode).json({
+      success: false,
+      error: error.message,
+      code: errorCode,
+    });
   }
 };
 
 /**
- * 팀 멤버십 검증 미들웨어
- * @param {boolean} requireLeader - 팀장 권한 필요 여부
+ * 선택적 인증 미들웨어
+ * 토큰이 있으면 검증하고, 없어도 다음으로 진행
  */
-export const requireTeamMembership = (requireLeader = false) => {
-  return async (req, res, next) => {
-    try {
-      const teamId = parseInt(req.params.teamId || req.body.teamId, 10);
-      const userId = req.user.userId;
-
-      if (!teamId) {
-        return forbidden(res, '팀 ID가 필요합니다');
-      }
-
-      // 팀 멤버십 확인
-      const membership = await Team.getMembership(teamId, userId);
-      if (!membership) {
-        return forbidden(res, '팀 멤버가 아닙니다');
-      }
-
-      // 팀장 권한 확인
-      if (requireLeader && membership.role !== 'leader') {
-        return forbidden(res, '팀장 권한이 필요합니다');
-      }
-
-      // 멤버십 정보를 request에 추가
-      req.teamMembership = membership;
-
-      logger.debug('팀 멤버십 검증 성공', {
-        userId,
-        teamId,
-        role: membership.role,
-        requireLeader
-      });
-
-      next();
-    } catch (error) {
-      logger.error('팀 멤버십 검증 실패', { error: error.message });
-      next(error);
-    }
-  };
-};
-
-/**
- * 리소스 소유권 검증 미들웨어
- * @param {Function} getResourceOwnerId - 리소스 소유자 ID를 가져오는 함수
- */
-export const requireOwnership = (getResourceOwnerId) => {
-  return async (req, res, next) => {
-    try {
-      const userId = req.user.userId;
-      const ownerId = await getResourceOwnerId(req);
-
-      if (userId !== ownerId) {
-        return forbidden(res, '소유자만 접근할 수 있습니다');
-      }
-
-      logger.debug('소유권 검증 성공', { userId, ownerId });
-      next();
-    } catch (error) {
-      logger.error('소유권 검증 실패', { error: error.message });
-      next(error);
-    }
-  };
-};
-
-/**
- * 선택적 인증 미들웨어 (토큰이 있으면 검증, 없으면 통과)
- */
-export const optionalAuthenticate = async (req, res, next) => {
+const optionalAuth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
 
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.substring(7);
-      const decoded = verifyToken(token);
 
-      req.user = {
-        userId: decoded.userId,
-        email: decoded.email
-      };
-
-      logger.debug('선택적 인증 성공', { userId: decoded.userId });
+      if (token) {
+        try {
+          const user = await AuthService.getUserFromToken(token);
+          req.user = user;
+          req.token = token;
+        } catch (error) {
+          // 선택적 인증에서는 토큰 오류 시에도 계속 진행
+          logger.warn('선택적 인증 토큰 오류:', { error: error.message });
+        }
+      }
     }
 
     next();
   } catch (error) {
-    logger.debug('선택적 인증 실패 (통과)', { error: error.message });
-    next();
+    logger.error('선택적 인증 미들웨어 오류:', { error: error.message });
+    next(); // 오류가 있어도 계속 진행
   }
 };
 
-export default {
-  authenticate,
+/**
+ * 팀 권한 확인 미들웨어
+ * 사용자가 특정 팀의 멤버인지 확인
+ */
+const requireTeamMembership = (paramName = 'teamId') => {
+  return async (req, res, next) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          error: '인증이 필요합니다',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      const teamId = parseInt(req.params[paramName]);
+
+      if (!teamId) {
+        return res.status(400).json({
+          success: false,
+          error: '유효한 팀 ID가 필요합니다',
+          code: 'INVALID_TEAM_ID',
+        });
+      }
+
+      const Team = require('../models/Team');
+      const isMember = await Team.isTeamMember(teamId, req.user.id);
+
+      if (!isMember) {
+        logger.audit('UNAUTHORIZED_TEAM_ACCESS', {
+          userId: req.user.id,
+          teamId,
+          action: req.method + ' ' + req.path,
+        });
+
+        return res.status(403).json({
+          success: false,
+          error: '팀 멤버만 접근할 수 있습니다',
+          code: 'NOT_TEAM_MEMBER',
+        });
+      }
+
+      req.teamId = teamId;
+      next();
+    } catch (error) {
+      logger.error('팀 멤버십 확인 오류:', {
+        error: error.message,
+        userId: req.user?.id,
+        teamId: req.params[paramName],
+      });
+
+      return res.status(500).json({
+        success: false,
+        error: '팀 권한 확인 중 오류가 발생했습니다',
+        code: 'TEAM_AUTH_ERROR',
+      });
+    }
+  };
+};
+
+/**
+ * 팀 리더 권한 확인 미들웨어
+ * 사용자가 특정 팀의 리더인지 확인
+ */
+const requireTeamLeadership = (paramName = 'teamId') => {
+  return async (req, res, next) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          success: false,
+          error: '인증이 필요합니다',
+          code: 'AUTH_REQUIRED',
+        });
+      }
+
+      const teamId = parseInt(req.params[paramName]);
+
+      if (!teamId) {
+        return res.status(400).json({
+          success: false,
+          error: '유효한 팀 ID가 필요합니다',
+          code: 'INVALID_TEAM_ID',
+        });
+      }
+
+      const Team = require('../models/Team');
+      const isLeader = await Team.isTeamLeader(teamId, req.user.id);
+
+      if (!isLeader) {
+        logger.audit('UNAUTHORIZED_TEAM_LEADER_ACCESS', {
+          userId: req.user.id,
+          teamId,
+          action: req.method + ' ' + req.path,
+        });
+
+        return res.status(403).json({
+          success: false,
+          error: '팀 리더만 접근할 수 있습니다',
+          code: 'NOT_TEAM_LEADER',
+        });
+      }
+
+      req.teamId = teamId;
+      next();
+    } catch (error) {
+      logger.error('팀 리더십 확인 오류:', {
+        error: error.message,
+        userId: req.user?.id,
+        teamId: req.params[paramName],
+      });
+
+      return res.status(500).json({
+        success: false,
+        error: '팀 리더 권한 확인 중 오류가 발생했습니다',
+        code: 'TEAM_LEADER_AUTH_ERROR',
+      });
+    }
+  };
+};
+
+/**
+ * 관리자 권한 확인 미들웨어
+ * 향후 관리자 기능 추가시 사용
+ */
+const requireAdmin = async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({
+        success: false,
+        error: '인증이 필요합니다',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    // 현재는 모든 사용자가 관리자 권한이 없다고 가정
+    // 향후 users 테이블에 role 컬럼 추가시 수정
+    return res.status(403).json({
+      success: false,
+      error: '관리자 권한이 필요합니다',
+      code: 'ADMIN_REQUIRED',
+    });
+  } catch (error) {
+    logger.error('관리자 권한 확인 오류:', {
+      error: error.message,
+      userId: req.user?.id,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: '관리자 권한 확인 중 오류가 발생했습니다',
+      code: 'ADMIN_AUTH_ERROR',
+    });
+  }
+};
+
+module.exports = {
+  authenticateToken,
+  optionalAuth,
   requireTeamMembership,
-  requireOwnership,
-  optionalAuthenticate
+  requireTeamLeadership,
+  requireAdmin,
 };

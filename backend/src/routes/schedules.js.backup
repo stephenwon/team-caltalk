@@ -391,7 +391,6 @@ const validateConflictCheck = [
  *                   type: array
  *                   items:
  *                     $ref: '#/components/schemas/ScheduleConflict'
- */
 router.post('/', validateScheduleCreation, async (req, res) => {
   try {
     const {
@@ -541,7 +540,6 @@ router.post('/', validateScheduleCreation, async (req, res) => {
  *               success: false
  *               error: 팀의 멤버만 해당 팀 일정을 조회할 수 있습니다
  *               code: NOT_TEAM_MEMBER
- */
 router.get('/', validateDateRange, async (req, res) => {
   try {
     const { startDate, endDate, teamId, scheduleType } = req.query;
@@ -626,7 +624,6 @@ router.get('/', validateDateRange, async (req, res) => {
  *               code: NO_SCHEDULE_ACCESS
  *       404:
  *         $ref: '#/components/responses/NotFound'
- */
 router.get('/:id', validateId('id'), async (req, res) => {
   try {
     const scheduleId = req.params.id;
@@ -795,7 +792,6 @@ router.get('/:id', validateId('id'), async (req, res) => {
  *                   type: array
  *                   items:
  *                     $ref: '#/components/schemas/ScheduleConflict'
- */
 router.put('/:id', validateId('id'), validateScheduleUpdate, async (req, res) => {
   try {
     const scheduleId = req.params.id;
@@ -917,7 +913,6 @@ router.put('/:id', validateId('id'), validateScheduleUpdate, async (req, res) =>
  *         $ref: '#/components/responses/NotFound'
  *       500:
  *         $ref: '#/components/responses/InternalServerError'
- */
 router.delete('/:id', validateId('id'), async (req, res) => {
   try {
     const scheduleId = req.params.id;
@@ -1035,7 +1030,6 @@ router.delete('/:id', validateId('id'), async (req, res) => {
  *         $ref: '#/components/responses/Unauthorized'
  *       500:
  *         $ref: '#/components/responses/InternalServerError'
- */
 router.post('/check-conflict', validateConflictCheck, async (req, res) => {
   try {
     const { startDatetime, endDatetime, participantIds, excludeScheduleId } = req.body;

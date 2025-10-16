@@ -1,100 +1,180 @@
-import pkg from 'pg';
-const { Pool } = pkg;
-import dotenv from 'dotenv';
-import logger from './logger.js';
-
-dotenv.config();
+const { Pool } = require('pg');
+const logger = require('./logger');
 
 /**
- * PostgreSQL 커넥션 풀 설정
- * Clean Architecture: Infrastructure Layer
+ * PostgreSQL 데이터베이스 연결 풀 설정
+ * 성능 최적화 및 연결 관리를 위한 커넥션 풀 구현
  */
-const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '5432', 10),
-  database: process.env.DB_NAME || 'team_caltalk_dev',
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD,
-  max: parseInt(process.env.DB_POOL_MAX || '20', 10),
-  min: parseInt(process.env.DB_POOL_MIN || '5', 10),
-  idleTimeoutMillis: parseInt(process.env.DB_POOL_IDLE_TIMEOUT || '30000', 10),
-  connectionTimeoutMillis: parseInt(process.env.DB_POOL_CONNECTION_TIMEOUT || '2000', 10),
-});
-
-// 풀 에러 핸들링
-pool.on('error', (err) => {
-  logger.error('데이터베이스 풀 예기치 않은 오류', { error: err.message, stack: err.stack });
-});
-
-// 연결 테스트
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    logger.error('데이터베이스 연결 실패', { error: err.message });
-  } else {
-    logger.info('데이터베이스 연결 성공', {
-      database: process.env.DB_NAME,
-      timestamp: res.rows[0].now
-    });
+class DatabaseConfig {
+  constructor() {
+    this.pool = null;
+    this.isConnected = false;
   }
-});
 
-/**
- * 쿼리 실행 헬퍼 (Prepared Statement 자동 적용)
- * @param {string} text - SQL 쿼리
- * @param {Array} params - 쿼리 파라미터
- * @returns {Promise<Object>} - 쿼리 결과
- */
-export const query = async (text, params) => {
-  const start = Date.now();
-  try {
-    const result = await pool.query(text, params);
-    const duration = Date.now() - start;
+  /**
+   * 데이터베이스 연결 풀 초기화
+   */
+  async initialize() {
+    try {
+      // 연결 문자열 디버깅 (비밀번호 마스킹)
+      const connStr = process.env.DB_CONNECTION_STRING;
+      if (connStr) {
+        const maskedConnStr = connStr.replace(/:([^@]+)@/, ':****@');
+        logger.info('데이터베이스 연결 시도:', { connectionString: maskedConnStr });
+      } else {
+        throw new Error('DB_CONNECTION_STRING 환경변수가 설정되지 않았습니다');
+      }
 
-    logger.debug('쿼리 실행 완료', {
-      query: text.substring(0, 100),
-      duration: `${duration}ms`,
-      rows: result.rowCount
-    });
+      const config = {
+        connectionString: process.env.DB_CONNECTION_STRING,
+        min: parseInt(process.env.DB_POOL_MIN) || 2,
+        max: parseInt(process.env.DB_POOL_MAX) || 20,
+        idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT) || 10000,
+        connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 2000,
+        statement_timeout: 30000, // 30초 쿼리 타임아웃
+        query_timeout: 30000,
+        application_name: 'team-caltalk-backend',
+        // SSL 설정 (프로덕션에서 필요시)
+        ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+      };
 
-    return result;
-  } catch (error) {
-    logger.error('쿼리 실행 실패', {
-      query: text.substring(0, 100),
-      error: error.message,
-      params
-    });
-    throw error;
+      this.pool = new Pool(config);
+
+      // 연결 이벤트 핸들링
+      this.pool.on('connect', () => {
+        logger.info('새로운 PostgreSQL 클라이언트 연결됨');
+      });
+
+      this.pool.on('error', (err) => {
+        logger.error('PostgreSQL 풀 오류:', err);
+        this.isConnected = false;
+      });
+
+      // 연결 테스트
+      await this.testConnection();
+      this.isConnected = true;
+
+      logger.info('PostgreSQL 연결 풀 초기화 완료', {
+        min: config.min,
+        max: config.max,
+        database: process.env.DB_NAME,
+      });
+
+      return this.pool;
+    } catch (error) {
+      logger.error('데이터베이스 연결 풀 초기화 실패:', error);
+      throw new Error(`데이터베이스 연결 실패: ${error.message}`);
+    }
   }
-};
 
-/**
- * 트랜잭션 실행 헬퍼
- * @param {Function} callback - 트랜잭션 내부 로직
- * @returns {Promise<any>} - 콜백 반환값
- */
-export const transaction = async (callback) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await callback(client);
-    await client.query('COMMIT');
-    logger.debug('트랜잭션 커밋 성공');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    logger.error('트랜잭션 롤백', { error: error.message });
-    throw error;
-  } finally {
-    client.release();
+  /**
+   * 데이터베이스 연결 테스트
+   */
+  async testConnection() {
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query('SELECT NOW() as current_time, version()');
+      logger.info('데이터베이스 연결 테스트 성공:', {
+        time: result.rows[0].current_time,
+        version: result.rows[0].version.split(' ')[0] + ' ' + result.rows[0].version.split(' ')[1],
+      });
+    } finally {
+      client.release();
+    }
   }
-};
 
-/**
- * 커넥션 풀 종료
- */
-export const closePool = async () => {
-  await pool.end();
-  logger.info('데이터베이스 커넥션 풀 종료');
-};
+  /**
+   * 트랜잭션 실행
+   * @param {Function} callback - 트랜잭션 내에서 실행할 함수
+   */
+  async transaction(callback) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      logger.error('트랜잭션 롤백:', error);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 
-export default pool;
+  /**
+   * 단일 쿼리 실행
+   * @param {string} text - SQL 쿼리
+   * @param {Array} params - 쿼리 파라미터
+   */
+  async query(text, params = []) {
+    const start = Date.now();
+    try {
+      const result = await this.pool.query(text, params);
+      const duration = Date.now() - start;
+
+      // 성능 모니터링 (느린 쿼리 로깅)
+      if (duration > 100) {
+        logger.warn('느린 쿼리 감지:', {
+          duration: `${duration}ms`,
+          query: text.substring(0, 100) + (text.length > 100 ? '...' : ''),
+          rowCount: result.rowCount,
+        });
+      }
+
+      return result;
+    } catch (error) {
+      logger.error('쿼리 실행 오류:', {
+        error: error.message,
+        query: text.substring(0, 100) + (text.length > 100 ? '...' : ''),
+        params: params,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * 연결 풀 상태 조회
+   */
+  getPoolStatus() {
+    if (!this.pool) {
+      return { status: 'not_initialized' };
+    }
+
+    return {
+      status: 'active',
+      totalCount: this.pool.totalCount,
+      idleCount: this.pool.idleCount,
+      waitingCount: this.pool.waitingCount,
+      isConnected: this.isConnected,
+    };
+  }
+
+  /**
+   * 연결 풀 종료
+   */
+  async close() {
+    if (this.pool) {
+      await this.pool.end();
+      this.isConnected = false;
+      logger.info('데이터베이스 연결 풀 종료됨');
+    }
+  }
+
+  /**
+   * 테스트용 pool 주입 (테스트 환경에서만 사용)
+   */
+  setTestPool(testPool) {
+    if (process.env.NODE_ENV === 'test') {
+      this.pool = testPool;
+      this.isConnected = true;
+      logger.info('테스트용 데이터베이스 풀 설정 완료');
+    }
+  }
+}
+
+// 싱글톤 인스턴스
+const databaseConfig = new DatabaseConfig();
+
+module.exports = databaseConfig;
