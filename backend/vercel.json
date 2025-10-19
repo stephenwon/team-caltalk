@@ -13,5 +13,8 @@
       "dest": "api/index.js"
     }
   ],
-  "regions": ["icn1"]
+  "regions": ["icn1"],
+  "git": {
+    "deploymentEnabled": false
+  }
 }
