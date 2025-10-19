@@ -2,7 +2,7 @@
   "name": "team-caltalk-backend",
   "version": "1.0.0",
   "description": "Team CalTalk 백엔드 서버 - 팀 기반 일정 관리 및 실시간 커뮤니케이션 플랫폼",
-  "main": "src/server.js",
+  "main": "index.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
