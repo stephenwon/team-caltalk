@@ -1,70 +1,61 @@
 /**
- * Vercel Serverless Function 엔트리포인트
- * Express 앱을 Serverless Function으로 래핑
+ * Vercel 서버리스 함수 진입점
+ *
+ * Vercel은 이 파일을 서버리스 함수로 실행합니다.
+ * Express 앱을 초기화하고 요청을 처리합니다.
  */
 
-const { initializeApp } = require('../src/app');
+const { createApp } = require('../src/app');
+const db = require('../src/config/database');
+const logger = require('../src/config/logger');
 
-let app;
-let initError = null;
+// Express 앱 인스턴스 캐싱 (콜드 스타트 최적화)
+let cachedApp = null;
+let isDbInitialized = false;
 
 /**
- * Serverless Function 핸들러
- * 앱 인스턴스를 재사용하여 cold start 최소화
+ * 애플리케이션 초기화 (캐시 사용)
+ */
+async function getApp() {
+  if (cachedApp) {
+    return cachedApp;
+  }
+
+  try {
+    // 데이터베이스 연결 초기화 (한 번만)
+    if (!isDbInitialized) {
+      await db.initialize();
+      isDbInitialized = true;
+      logger.info('Vercel: 데이터베이스 연결 완료');
+    }
+
+    // Express 앱 생성
+    cachedApp = await createApp();
+    logger.info('Vercel: Express 애플리케이션 초기화 완료');
+
+    return cachedApp;
+  } catch (error) {
+    logger.error('Vercel: 애플리케이션 초기화 실패:', error);
+    throw error;
+  }
+}
+
+/**
+ * Vercel 서버리스 함수 핸들러
+ *
+ * 모든 HTTP 요청을 Express 앱으로 전달합니다.
  */
 module.exports = async (req, res) => {
   try {
-    // 앱이 초기화되지 않았다면 초기화
-    if (!app && !initError) {
-      console.log('Initializing Express app for Vercel Serverless Function...');
-      console.log('Environment check:', {
-        NODE_ENV: process.env.NODE_ENV,
-        VERCEL: process.env.VERCEL,
-        hasDbConnectionString: !!process.env.DB_CONNECTION_STRING,
-        hasJwtSecret: !!process.env.JWT_SECRET,
-      });
-
-      try {
-        app = await initializeApp();
-        console.log('Express app initialized successfully');
-      } catch (error) {
-        initError = error;
-        console.error('App initialization failed:', {
-          message: error.message,
-          stack: error.stack,
-          code: error.code,
-        });
-        throw error;
-      }
-    }
-
-    // 초기화 실패한 경우
-    if (initError) {
-      console.error('Using cached init error:', initError.message);
-      throw initError;
-    }
-
-    // Express 앱에 요청 전달
+    const app = await getApp();
     return app(req, res);
   } catch (error) {
-    console.error('Serverless Function Error:', {
-      message: error.message,
-      stack: error.stack,
-      code: error.code,
-      name: error.name,
-    });
+    logger.error('Vercel: 요청 처리 중 오류:', error);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      error: 'Internal Server Error',
-      message: process.env.NODE_ENV === 'production'
-        ? '서버 내부 오류가 발생했습니다'
-        : error.message,
-      details: process.env.NODE_ENV === 'production' ? undefined : {
-        name: error.name,
-        code: error.code,
-        stack: error.stack,
-      },
+      error: '서버 초기화 중 오류가 발생했습니다',
+      code: 'SERVERLESS_INIT_ERROR',
     });
   }
 };

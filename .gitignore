@@ -83,3 +83,6 @@ dist/
 build/
 out/
 .playwright-mcp/
+
+# Vercel
+.vercel

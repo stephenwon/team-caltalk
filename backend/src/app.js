@@ -236,3 +236,6 @@ module.exports = {
   initializeApp,
   gracefulShutdown,
 };
+
+// Vercel 서버리스 배포를 위한 default export
+module.exports.default = createApp;
