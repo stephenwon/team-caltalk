@@ -82,3 +82,4 @@ tmp/
 dist/
 build/
 out/
+.playwright-mcp/
